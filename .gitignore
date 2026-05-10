@@ -6,6 +6,8 @@ build/
 
 # Python cache
 python/*/__pycache__
+__pycache__/
+*.pyc
 
 # Model files
 *.sbs
@@ -23,3 +25,5 @@ python/*/__pycache__
 # Local development
 .env
 .env.local
+.rocprofv3/
+gemma.cpp_rocm.txt

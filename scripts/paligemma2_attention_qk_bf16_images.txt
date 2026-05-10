@@ -1,0 +1,7 @@
+# One PPM image path per line. Blank lines and comments are ignored.
+paligemma/testdata/image.ppm
+paligemma/testdata/qk_bf16_sweep/gradient_blocks.ppm
+paligemma/testdata/qk_bf16_sweep/checker_edges.ppm
+paligemma/testdata/qk_bf16_sweep/color_quadrants.ppm
+# Known current mismatch for 448 + "Describe the image.".
+paligemma/testdata/qk_bf16_sweep/dark_radial.ppm

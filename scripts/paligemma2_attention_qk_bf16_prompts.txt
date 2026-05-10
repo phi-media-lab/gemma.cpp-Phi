@@ -1,0 +1,4 @@
+# One prompt per line. Blank lines and comments are ignored.
+Describe the image.
+What is in the image?
+Describe the building.
