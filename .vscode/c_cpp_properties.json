@@ -2,13 +2,59 @@
     "configurations": [
         {
             "name": "Linux",
-            "includePath": [
-                "${workspaceFolder}/**"
+            "compilerPath": "/opt/rocm/bin/hipcc",
+            "compilerArgs": [
+                "--offload-arch=gfx1150",
+                "-std=c++17",
+                "-x",
+                "c++"
             ],
-            "defines": [],
+            "includePath": [
+                "${workspaceFolder}/.vscode/include",
+                "${workspaceFolder}",
+                "${workspaceFolder}/build/_deps/highway-src",
+                "${workspaceFolder}/build/_deps/sentencepiece-src/src",
+                "${workspaceFolder}/build/_deps/sentencepiece-build/src",
+                "/opt/rocm/include",
+                "/opt/rocm-7.2.1/include",
+                "/opt/rocm-7.2.1/lib/llvm/lib/clang/22/include",
+                "/opt/rocm-7.2.1/lib/llvm/include/c++/v1",
+                "/usr/local/include",
+                "/usr/include/c++/13",
+                "/usr/include/x86_64-linux-gnu/c++/13",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include"
+            ],
+            "defines": [
+                "__HIP_PLATFORM_AMD__",
+                "__HIP__",
+                "__HIPCC__"
+            ],
             "cStandard": "c17",
             "cppStandard": "c++17",
-            "intelliSenseMode": "linux-clang-x64"
+            "intelliSenseMode": "linux-clang-x64",
+            "compileCommands": "${workspaceFolder}/.vscode/compile_commands.json",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "${workspaceFolder}/.vscode/include",
+                    "${workspaceFolder}/build/_deps/highway-src",
+                    "${workspaceFolder}/build/_deps/sentencepiece-src/src",
+                    "${workspaceFolder}/build/_deps/sentencepiece-build/src",
+                    "/opt/rocm/include",
+                    "/opt/rocm-7.2.1/include",
+                    "/opt/rocm-7.2.1/lib/llvm/lib/clang/22/include",
+                    "/opt/rocm-7.2.1/lib/llvm/include/c++/v1",
+                    "/usr/local/include",
+                    "/usr/include/c++/13",
+                    "/usr/include/x86_64-linux-gnu/c++/13",
+                    "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+                    "/usr/include/x86_64-linux-gnu",
+                    "/usr/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
         }
     ],
     "version": 4

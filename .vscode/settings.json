@@ -1,5 +1,10 @@
 {
     "cmake.configureOnOpen": false,
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/.vscode/compile_commands.json",
+    "C_Cpp.default.compilerPath": "/opt/rocm/bin/hipcc",
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.cStandard": "c17",
+    "C_Cpp.default.intelliSenseMode": "linux-clang-x64",
     "files.associations": {
         "array": "cpp"
     }
