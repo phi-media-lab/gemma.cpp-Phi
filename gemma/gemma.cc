@@ -72,17 +72,26 @@ namespace HWY_NAMESPACE {
 
 void Attention(LayerAttentionType type, const size_t num_tokens,
                const size_t layer_idx, const LayerWeightsPtrs& layer,
-               Activations& activations, QBatch& qbatch, MatMulEnv& env) {
+               const RuntimeConfig& runtime_config, Activations& activations,
+               QBatch& qbatch, MatMulEnv& env) {
   if (type == LayerAttentionType::kGemma) {
-    // TODO: remove flag to enable FlashAttention.
+    // Keep the existing native-BF16 default unless the caller explicitly asks
+    // for FlashAttention. This makes the PaliGemma2 448 experiment reversible:
+    // the benchmark flag can test long-prefix behavior without silently changing
+    // the default path for all Gemma decoder users.
+    const int flags =
+        (HWY_NATIVE_DOT_BF16 && !runtime_config.force_flash_attention)
+            ? kAttentionUseOld
+            : 0;
     GemmaAttention(num_tokens, layer_idx, layer, activations.attention, qbatch,
-                   env, HWY_NATIVE_DOT_BF16 ? kAttentionUseOld : 0);
+                   env, flags);
   }
 }
 
 static HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
                                           const size_t layer_idx,
                                           const LayerWeightsPtrs& layer,
+                                          const RuntimeConfig& runtime_config,
                                           Activations& activations,
                                           QBatch& qbatch, MatMulEnv& env) {
   const LayerConfig& layer_config = layer.layer_config;
@@ -90,8 +99,8 @@ static HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
   RMSNormBatched(activations.x, layer.pre_attention_norm_scale,
                  activations.attention.pre_att_rms_out, env.ctx);
 
-  Attention(layer_config.type, num_tokens, layer_idx, layer, activations,
-            qbatch, env);
+  Attention(layer_config.type, num_tokens, layer_idx, layer, runtime_config,
+            activations, qbatch, env);
 
   PostNorm(layer_config.post_norm, layer.post_attention_norm_scale,
            activations.attention.att_sums, env.ctx);
@@ -265,7 +274,7 @@ static HWY_NOINLINE void PrefillTBatch(const ModelConfig& config,
       for (size_t layer_idx = 0; layer_idx < config.layer_configs.size();
            ++layer_idx) {
         TransformerLayer(tbatch_size, layer_idx, *weights.GetLayer(layer_idx),
-                         activations, qbatch_1, env);
+                         runtime_config, activations, qbatch_1, env);
       }
 
       qbatch_1.MutablePos(0) += tbatch_size;
@@ -320,7 +329,7 @@ static HWY_NOINLINE void Transformer(const ModelConfig& config,
 
   for (size_t layer_idx = 0; layer_idx < weights.c_layers.size(); ++layer_idx) {
     TransformerLayer(/*num_tokens=*/1, layer_idx, *weights.GetLayer(layer_idx),
-                     activations, qbatch, env);
+                     runtime_config, activations, qbatch, env);
 
     MaybeObserve(runtime_config, activations, qbatch, layer_idx);
   }
@@ -431,11 +440,16 @@ static void SampleAndStream(const ModelConfig& config,
       [&](size_t qi, size_t worker) {
         if (!non_eos.Get(qi)) return;
 
-        // We streamed all prefill tokens, but pos is still one behind
-        // because we started generation at pos = prompt.size() - 1.
-        // We want the pos argument to match the number of calls to
-        // `StreamToken`, as expected by the caller.
-        const size_t pos = qbatch.Pos(qi) + 1;
+        // Position accounting differs between the usual causal prompt path and
+        // PaliGemma's full-prefix LM path. Causal generation starts one token
+        // before the end of the prompt, so qbatch.Pos() is one behind the number
+        // of streamed tokens. Full-prefix mode has already advanced through the
+        // whole prompt, including image-token prefix expansion, so adding one
+        // would make StreamToken observe pos != abs_pos and abort.
+        const bool full_prompt_prefix =
+            qbatch.PrefixEnd(qi) ==
+            qbatch.InitialPos(qi) + qbatch.Prompt(qi).size();
+        const size_t pos = qbatch.Pos(qi) + (full_prompt_prefix ? 0 : 1);
 
         const TokenAndProb tp =
             sample_token(qi, pos, activations.logits.RowSpan(qi), worker);
@@ -611,6 +625,17 @@ void GenerateImageTokensT(const ModelConfig& config,
                           ImageTokens& image_tokens, MatMulEnv& env) {
   if (config.vit_config.layer_configs.empty()) {
     HWY_ABORT("Model does not support generating image tokens.");
+  }
+  // Give an experimental backend the first chance to satisfy the image-token
+  // request. This call sits at the real image encoder boundary, so a backend
+  // that returns true must have produced decoder-ready image tokens. Returning
+  // false keeps the mature CPU ViT path below as the fallback and is useful for
+  // probes that only validate resident weights or intermediate tensors.
+  if (runtime_config.image_tokens_backend_func != nullptr &&
+      runtime_config.image_tokens_backend_func(
+          runtime_config.image_tokens_backend, config, weights, seq_len, image,
+          image_tokens, env)) {
+    return;
   }
   RuntimeConfig prefill_runtime_config = runtime_config;
   const ModelConfig vit_config = GetVitConfig(config);

@@ -18,6 +18,7 @@
 #include <stdio.h>
 
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,6 +34,10 @@
 #include "hwy/base.h"
 #include "hwy/highway.h"
 #include "hwy/profiler.h"
+
+#ifdef GCPP_EXPERIMENTAL_PALIGEMMA2_VIT_HIP
+#include "experimental/paligemma2_vit_hip_backend.h"
+#endif
 
 #if (!defined(HWY_VERSION_LT) || HWY_VERSION_LT(1, 2)) && !HWY_IDE
 #error "Please update to version 1.2 of github.com/google/highway."
@@ -90,12 +95,21 @@ std::string GetPrompt(const InferenceArgs& inference) {
 
 // The main Read-Eval-Print Loop.
 void ReplGemma(const ThreadingArgs& threading, const InferenceArgs& inference,
-               const Gemma& gemma, KVCache& kv_cache, MatMulEnv& env) {
+               const Gemma& gemma, KVCache& kv_cache, MatMulEnv& env,
+               MatMulEnv* image_env, void* image_tokens_backend,
+               ImageTokensBackendFunc image_tokens_backend_func) {
   PROFILER_ZONE("Gen.misc");
   size_t abs_pos = 0;                     // across turns
   size_t tokens_generated_this_turn = 0;  // differentiates prefill from reply
   size_t prompt_size = 0;
   const ModelConfig& config = gemma.Config();
+
+  // Most inference uses the main MatMulEnv for both image encoding and decoder
+  // work. PaliGemma2 448 benchmarks showed that the image encoder can prefer a
+  // different logical-processor subset, so callers may pass a dedicated image
+  // MatMulEnv. ImageTokens must be allocated from the same allocator/env that
+  // will run GenerateImageTokens because row pointers and padding live there.
+  MatMulEnv& image_matmul_env = image_env == nullptr ? env : *image_env;
 
   const bool have_image = !inference.image_file.path.empty();
   Image image;
@@ -105,8 +119,8 @@ void ReplGemma(const ThreadingArgs& threading, const InferenceArgs& inference,
       have_image ? Extents2D(config.vit_config.seq_len / (pool_dim * pool_dim),
                              config.model_dim)
                  : Extents2D(0, 0),
-      env.ctx.allocator, MatPadding::kOdd);
-  image_tokens.AllocateAndAttachRowPtrs(env.row_ptrs);
+      image_matmul_env.ctx.allocator, MatPadding::kOdd);
+  image_tokens.AllocateAndAttachRowPtrs(image_matmul_env.row_ptrs);
   if (have_image) {
     HWY_ASSERT(config.wrapping == PromptWrapping::PALIGEMMA ||
                config.wrapping == PromptWrapping::GEMMA_VLM);
@@ -115,9 +129,11 @@ void ReplGemma(const ThreadingArgs& threading, const InferenceArgs& inference,
     image.Resize(image_size, image_size);
     RuntimeConfig runtime_config = {.verbosity = inference.verbosity,
                                     .use_spinning = threading.spin};
+    runtime_config.image_tokens_backend = image_tokens_backend;
+    runtime_config.image_tokens_backend_func = image_tokens_backend_func;
     double image_tokens_start = hwy::platform::Now();
     gemma.GenerateImageTokens(runtime_config, kv_cache.SeqLen(), image,
-                              image_tokens, env);
+                              image_tokens, image_matmul_env);
     if (inference.verbosity >= 1) {
       double image_tokens_duration = hwy::platform::Now() - image_tokens_start;
       fprintf(stderr,
@@ -258,6 +274,138 @@ void Run(const LoaderArgs& loader, const ThreadingArgs& threading,
   const Gemma gemma(loader, inference, ctx);
   KVCache kv_cache(gemma.Config(), inference, ctx.allocator);
 
+  // Optional phase-specific image environment. This deliberately creates a fresh
+  // ThreadingContext instead of changing affinity on existing worker pools: the
+  // failed affinity experiment showed that constraining already-created pools
+  // oversubscribes the selected CPUs. Constructing the image context with the
+  // target LP range lets topology discovery and worker counts match the phase.
+  std::unique_ptr<ThreadingContext> image_ctx;
+  std::unique_ptr<MatMulEnv> image_env;
+  if (inference.image_max_lps != 0 && !inference.image_file.path.empty()) {
+    ThreadingArgs image_threading = threading;
+    image_threading.skip_lps = inference.image_skip_lps;
+    image_threading.max_lps = inference.image_max_lps;
+    image_ctx = std::make_unique<ThreadingContext>(image_threading);
+    image_env = std::make_unique<MatMulEnv>(*image_ctx);
+    if (inference.verbosity >= 3) image_env->print_best = true;
+  }
+
+  void* image_tokens_backend = nullptr;
+  ImageTokensBackendFunc image_tokens_backend_func = nullptr;
+#ifdef GCPP_EXPERIMENTAL_PALIGEMMA2_VIT_HIP
+  std::unique_ptr<experimental::PaliGemma2VitHipBackend> vit_hip_backend;
+  if (inference.paligemma_vit_backend == "hip_probe") {
+    if (inference.paligemma_vit_hip_samples <= 0 ||
+        inference.paligemma_vit_hip_warmup <= 0 ||
+        inference.paligemma_vit_hip_iters <= 0) {
+      HWY_ABORT("paligemma_vit_hip_* values must be positive.\n");
+    }
+    experimental::PaliGemma2VitHipOptions options{
+        .samples = inference.paligemma_vit_hip_samples,
+        .warmup = inference.paligemma_vit_hip_warmup,
+        .iters = inference.paligemma_vit_hip_iters,
+        .verbose = inference.verbosity >= 1,
+        .benchmark_projection_schedule = true,
+        .validate_patch_embedding =
+            inference.paligemma_vit_hip_validate_patch,
+        .validate_layer0_qkv = inference.paligemma_vit_hip_validate_qkv,
+        .validate_layer0_mlp = inference.paligemma_vit_hip_validate_mlp,
+        .validate_layer0_attn_out =
+            inference.paligemma_vit_hip_validate_attn_out,
+        .validate_layer0_block =
+            inference.paligemma_vit_hip_validate_layer0_block,
+        .validate_layer0_device_attention =
+            inference.paligemma_vit_hip_validate_device_attention,
+        .validate_layer0_block_device_attention =
+            inference
+                .paligemma_vit_hip_validate_layer0_block_device_attention,
+        .validate_layer0_block_device_norm =
+            inference.paligemma_vit_hip_validate_layer0_block_device_norm,
+        .validate_layer_prefix2_device_norm =
+            inference.paligemma_vit_hip_validate_layer_prefix2_device_norm,
+        .validate_layer_stack_device_norm =
+            inference.paligemma_vit_hip_validate_layer_stack_device_norm,
+        .validate_image_tokens_device_norm =
+            inference.paligemma_vit_hip_validate_image_tokens_device_norm,
+        .return_image_tokens_device_norm =
+            inference.paligemma_vit_hip_return_image_tokens,
+        .use_attention_qk_bf16 =
+            inference.paligemma_vit_hip_attention_qk_bf16,
+        .use_attention_qk_bf16_wmma =
+            inference.paligemma_vit_hip_attention_qk_bf16_wmma,
+        .use_attention_av_bf16_wmma =
+            inference.paligemma_vit_hip_attention_av_bf16_wmma,
+        .use_attention_av_f32_dim4 =
+            inference.paligemma_vit_hip_attention_av_f32_dim4,
+        .use_attention_pack_bf16 =
+            inference.paligemma_vit_hip_attention_pack_bf16,
+        .use_attention_direct_qkv =
+            inference.paligemma_vit_hip_attention_direct_qkv,
+        .use_attention_defer_softmax_scale =
+            inference.paligemma_vit_hip_attention_defer_softmax_scale,
+        .attention_qk_solution_index =
+            inference.paligemma_vit_hip_attention_qk_solution,
+        .attention_av_solution_index =
+            inference.paligemma_vit_hip_attention_av_solution,
+        .use_qkv_wmma2d = inference.paligemma_vit_hip_qkv_wmma2d,
+        .use_attn_out_wmma2d =
+            inference.paligemma_vit_hip_attn_out_wmma2d,
+        .use_mlp_up_wmma2d = inference.paligemma_vit_hip_mlp_up_wmma2d,
+        .use_mlp_down_wmma8 = inference.paligemma_vit_hip_mlp_down_wmma8,
+        .use_mlp_down_fused_residual =
+            inference.paligemma_vit_hip_mlp_down_fused_residual,
+        .mlp_down_wmma_waves =
+            inference.paligemma_vit_hip_mlp_down_wmma_waves,
+    };
+    // The HIP backend is kept out of the normal `gemma` target so CPU-only
+    // builds do not acquire ROCm link/runtime dependencies. The experimental
+    // binary owns this object for the entire REPL call and passes it through the
+    // opaque RuntimeConfig hook. At the current stage `hip_probe` validates GPU
+    // work and then returns false, so the CPU image encoder still supplies the
+    // decoder-visible image tokens.
+    vit_hip_backend =
+        std::make_unique<experimental::PaliGemma2VitHipBackend>(options);
+    const bool load_mlp_cache =
+        !inference.paligemma_vit_hip_mlp_solution_cache.empty();
+    const bool load_attention_cache =
+        !inference.paligemma_vit_hip_attention_solution_cache.empty();
+    if (load_mlp_cache || load_attention_cache) {
+      if (!vit_hip_backend->Initialize()) {
+        HWY_ABORT("Failed to initialize PaliGemma ViT HIP backend.\n");
+      }
+    }
+    if (load_mlp_cache) {
+      if (!vit_hip_backend->LoadMlpGemmSolutionCache(
+              gemma.Config(), gemma.Weights(),
+              inference.paligemma_vit_hip_mlp_solution_cache)) {
+        HWY_ABORT("Failed to load paligemma_vit_hip_mlp_solution_cache '%s'.\n",
+                  inference.paligemma_vit_hip_mlp_solution_cache.c_str());
+      }
+    }
+    if (load_attention_cache) {
+      if (!vit_hip_backend->LoadAttentionGemmSolutionCache(
+              gemma.Config(), gemma.Weights(),
+              inference.paligemma_vit_hip_attention_solution_cache)) {
+        HWY_ABORT("Failed to load paligemma_vit_hip_attention_solution_cache "
+                  "'%s'.\n",
+                  inference.paligemma_vit_hip_attention_solution_cache.c_str());
+      }
+    }
+    image_tokens_backend = vit_hip_backend.get();
+    image_tokens_backend_func =
+        experimental::PaliGemma2VitHipImageTokensBackend;
+  } else if (inference.paligemma_vit_backend != "cpu") {
+    HWY_ABORT("Unknown paligemma_vit_backend '%s'. Use cpu or hip_probe.\n",
+              inference.paligemma_vit_backend.c_str());
+  }
+#else
+  if (inference.paligemma_vit_backend != "cpu") {
+    HWY_ABORT("paligemma_vit_backend=%s requires the experimental HIP binary. "
+              "Build it with scripts/build_gemma_paligemma2_vit_hip.sh.\n",
+              inference.paligemma_vit_backend.c_str());
+  }
+#endif
+
   if (inference.verbosity >= 1) {
     std::string instructions =
         "*Usage*\n"
@@ -289,7 +437,8 @@ void Run(const LoaderArgs& loader, const ThreadingArgs& threading,
     }
   }
 
-  ReplGemma(threading, inference, gemma, kv_cache, env);
+  ReplGemma(threading, inference, gemma, kv_cache, env, image_env.get(),
+            image_tokens_backend, image_tokens_backend_func);
 }
 
 }  // namespace gcpp

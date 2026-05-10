@@ -34,6 +34,11 @@
 
 namespace gcpp {
 
+struct MatMulEnv;
+struct ModelConfig;
+struct WeightsPtrs;
+class Image;
+
 struct LoaderArgs : public ArgsBase<LoaderArgs> {
   LoaderArgs(int argc, char* argv[]) { InitAndParse(argc, argv); }
   LoaderArgs(const std::string& tokenizer_path,
@@ -75,6 +80,21 @@ using QueriesPos = hwy::Span<const size_t>;
 // ImageTokens are represented as a matrix, where each row corresponds
 // to a token for an image patch as computed by the image encoder.
 using ImageTokens = MatStorageT<float>;
+
+// Experimental hook for replacing the image-token generator.
+//
+// Contract:
+// - `backend` is opaque state owned by the caller that builds RuntimeConfig.
+// - Implementations may inspect model weights and run device-side work.
+// - Return true only after fully populating `image_tokens` with the same layout
+//   expected by the decoder prefix path.
+// - Return false to fall back to the normal CPU ViT implementation. The current
+//   HIP probe intentionally does this after validation so correctness remains
+//   anchored to the existing CPU code.
+using ImageTokensBackendFunc =
+    bool (*)(void* backend, const ModelConfig& model_config,
+             const WeightsPtrs& weights, size_t seq_len, const Image& image,
+             ImageTokens& image_tokens, MatMulEnv& env);
 
 // StreamFunc is called with (token, probability). For prompt tokens,
 // probability is 0.0f. StreamFunc should return false to stop generation and
@@ -149,9 +169,24 @@ struct RuntimeConfig {
   LayersOutputFunc layers_output;  // if not empty, called after each layer.
   ActivationsObserverFunc activations_observer;  // if set, called per-layer.
 
+  // Experimental decoder-attention override. On AVX-512 BF16 targets the
+  // existing default intentionally routes Gemma decoder attention through the
+  // older BF16 dot-product path. PaliGemma2 448 has a large image/text prefix,
+  // so this flag lets benchmarks force FlashAttention without changing the
+  // production default for other models.
+  bool force_flash_attention = false;
+
   // If not empty, these point to the image tokens and are used in the
   // PaliGemma prefix-LM style attention.
   const ImageTokens* image_tokens = nullptr;
+
+  // Optional backend hook for the image encoder. The pointer/function pair is
+  // intentionally opaque so experimental device backends can live outside
+  // libgemma and still plug into the real GenerateImageTokens flow. libgemma
+  // does not own or delete `image_tokens_backend`; the creator of RuntimeConfig
+  // must keep it alive for the duration of GenerateImageTokens.
+  void* image_tokens_backend = nullptr;
+  ImageTokensBackendFunc image_tokens_backend_func = nullptr;
 
   // Whether to use thread spinning to reduce barrier synchronization latency.
   // Mutable so we can change kDefault to kTrue/kFalse during Generate, because
@@ -179,7 +214,48 @@ struct InferenceArgs : public ArgsBase<InferenceArgs> {
   size_t top_k;
   bool deterministic;
   bool multiturn;
+
+  // Experimental PaliGemma image-phase controls. These are CLI-level knobs, not
+  // RuntimeConfig fields, because they affect ThreadingContext construction
+  // before GenerateImageTokens runs. A zero image_max_lps keeps the original
+  // single-context behavior.
+  bool force_flash_attention;
   Path image_file;
+  size_t image_skip_lps;
+  size_t image_max_lps;
+  std::string paligemma_vit_backend;
+  int paligemma_vit_hip_samples;
+  int paligemma_vit_hip_warmup;
+  int paligemma_vit_hip_iters;
+  bool paligemma_vit_hip_validate_patch;
+  bool paligemma_vit_hip_validate_qkv;
+  bool paligemma_vit_hip_validate_mlp;
+  bool paligemma_vit_hip_validate_attn_out;
+  bool paligemma_vit_hip_validate_layer0_block;
+  bool paligemma_vit_hip_validate_device_attention;
+  bool paligemma_vit_hip_validate_layer0_block_device_attention;
+  bool paligemma_vit_hip_validate_layer0_block_device_norm;
+  bool paligemma_vit_hip_validate_layer_prefix2_device_norm;
+  bool paligemma_vit_hip_validate_layer_stack_device_norm;
+  bool paligemma_vit_hip_validate_image_tokens_device_norm;
+  bool paligemma_vit_hip_return_image_tokens;
+  bool paligemma_vit_hip_attention_qk_bf16;
+  bool paligemma_vit_hip_attention_qk_bf16_wmma;
+  bool paligemma_vit_hip_attention_av_bf16_wmma;
+  bool paligemma_vit_hip_attention_av_f32_dim4;
+  bool paligemma_vit_hip_attention_pack_bf16;
+  bool paligemma_vit_hip_attention_direct_qkv;
+  bool paligemma_vit_hip_attention_defer_softmax_scale;
+  int paligemma_vit_hip_attention_qk_solution;
+  int paligemma_vit_hip_attention_av_solution;
+  bool paligemma_vit_hip_qkv_wmma2d;
+  bool paligemma_vit_hip_attn_out_wmma2d;
+  bool paligemma_vit_hip_mlp_up_wmma2d;
+  bool paligemma_vit_hip_mlp_down_wmma8;
+  bool paligemma_vit_hip_mlp_down_fused_residual;
+  int paligemma_vit_hip_mlp_down_wmma_waves;
+  std::string paligemma_vit_hip_mlp_solution_cache;
+  std::string paligemma_vit_hip_attention_solution_cache;
 
   int port;            // Server port
   std::string model;   // Model name for API endpoints
@@ -216,7 +292,217 @@ struct InferenceArgs : public ArgsBase<InferenceArgs> {
             "interaction\n    1 = continue KV cache after every interaction\n  "
             "  Default : 0 (conversation "
             "resets every turn)");
+
+    // Benchmark-only switch for comparing decoder attention implementations on
+    // the same binary and weights. It only influences Gemma decoder layers; the
+    // ViT image encoder has its own attention implementation.
+    visitor(force_flash_attention, "force_flash_attention", false,
+            "Experimental: force decoder FlashAttention instead of the default "
+            "attention path.",
+            2);
     visitor(image_file, "image_file", Path(), "Image file to load.");
+
+    // Benchmark-only image-threading switch. `image_skip_lps` and
+    // `image_max_lps` are forwarded into a separate ThreadingContext used only
+    // for GenerateImageTokens, so the decoder can keep the main topology.
+    visitor(image_skip_lps, "image_skip_lps", size_t{0},
+            "Experimental: first logical processor to use for image-token "
+            "generation when image_max_lps is nonzero.",
+            2);
+    visitor(image_max_lps, "image_max_lps", size_t{0},
+            "Experimental: max logical processors to use for image-token "
+            "generation. Default 0 uses the main threading context.",
+            2);
+    visitor(paligemma_vit_backend, "paligemma_vit_backend",
+            std::string("cpu"),
+            "Experimental: PaliGemma image encoder backend. Values: cpu, "
+            "hip_probe. hip_probe uploads resident HIP projection weights and "
+            "falls back to CPU for correctness.",
+            2);
+    visitor(paligemma_vit_hip_samples, "paligemma_vit_hip_samples", 1,
+            "Experimental: samples for hip_probe resident projection timing.",
+            3);
+    visitor(paligemma_vit_hip_warmup, "paligemma_vit_hip_warmup", 1,
+            "Experimental: warmup iterations for hip_probe resident projection "
+            "timing.",
+            3);
+    visitor(paligemma_vit_hip_iters, "paligemma_vit_hip_iters", 1,
+            "Experimental: timed inner iterations for hip_probe resident "
+            "projection timing.",
+            3);
+    visitor(paligemma_vit_hip_validate_patch,
+            "paligemma_vit_hip_validate_patch", false,
+            "Experimental: validate HIP patch embedding against a CPU scalar "
+            "reference inside hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_qkv, "paligemma_vit_hip_validate_qkv",
+            false,
+            "Experimental: validate HIP layer0 QKV projection F32/BF16 paths "
+            "inside hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_mlp, "paligemma_vit_hip_validate_mlp",
+            false,
+            "Experimental: validate HIP layer0 MLP up/GELU/down F32/BF16 paths "
+            "inside hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_attn_out,
+            "paligemma_vit_hip_validate_attn_out", false,
+            "Experimental: validate HIP layer0 attention-output projection and "
+            "residual F32/BF16 paths inside hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_layer0_block,
+            "paligemma_vit_hip_validate_layer0_block", false,
+            "Experimental: validate full HIP layer0 output F32/BF16 paths "
+            "inside hip_probe, with attention softmax as a host reference.",
+            3);
+    visitor(paligemma_vit_hip_validate_device_attention,
+            "paligemma_vit_hip_validate_device_attention", false,
+            "Experimental: validate layer0 HIP device attention core "
+            "(QK + softmax + AV) inside hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_layer0_block_device_attention,
+            "paligemma_vit_hip_validate_layer0_block_device_attention", false,
+            "Experimental: validate full HIP layer0 output using device "
+            "attention inside hip_probe. This legacy flag currently aliases "
+            "the device input/layernorm validation path.",
+            3);
+    visitor(paligemma_vit_hip_validate_layer0_block_device_norm,
+            "paligemma_vit_hip_validate_layer0_block_device_norm", false,
+            "Experimental: validate full HIP layer0 output using device "
+            "patch embedding, device attention, and device layernorms inside "
+            "hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_layer_prefix2_device_norm,
+            "paligemma_vit_hip_validate_layer_prefix2_device_norm", false,
+            "Experimental: validate a two-layer HIP ViT prefix using device "
+            "patch embedding, the reusable device layer runner, and BF16 vs "
+            "F32-shadow comparison inside hip_probe.",
+            3);
+    visitor(paligemma_vit_hip_validate_layer_stack_device_norm,
+            "paligemma_vit_hip_validate_layer_stack_device_norm", false,
+            "Experimental: validate the full HIP ViT transformer stack through "
+            "the reusable device layer runner, stopping before final encoder "
+            "norm and image head.",
+            3);
+    visitor(paligemma_vit_hip_validate_image_tokens_device_norm,
+            "paligemma_vit_hip_validate_image_tokens_device_norm", false,
+            "Experimental: validate HIP PaliGemma image tokens through final "
+            "encoder norm and image head. The CLI compares BF16 vs F32-shadow "
+            "inside hip_probe and then falls back to CPU image tokens.",
+            3);
+    visitor(paligemma_vit_hip_return_image_tokens,
+            "paligemma_vit_hip_return_image_tokens", false,
+            "Experimental: return HIP-produced BF16 PaliGemma image tokens from "
+            "hip_probe so the decoder consumes them. This is an explicit A/B "
+            "test knob and still runs the F32-shadow diagnostics.",
+            3);
+    visitor(paligemma_vit_hip_attention_qk_bf16,
+            "paligemma_vit_hip_attention_qk_bf16", false,
+            "Experimental: use BF16 Q/K for the HIP PaliGemma ViT attention "
+            "QK GEMM while keeping V, softmax scores, and AV in F32. This only "
+            "affects hip_probe return/profile paths and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_attention_qk_bf16_wmma,
+            "paligemma_vit_hip_attention_qk_bf16_wmma", false,
+            "Experimental: use the local grouped-2D RDNA WMMA BF16 QK kernel "
+            "for HIP PaliGemma ViT attention while keeping V, softmax scores, "
+            "and AV in F32. This has the same precision caveat as "
+            "paligemma_vit_hip_attention_qk_bf16 and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_attention_av_bf16_wmma,
+            "paligemma_vit_hip_attention_av_bf16_wmma", false,
+            "Experimental: keep HIP PaliGemma ViT attention QK in F32, but "
+            "store normalized softmax scores as BF16 and run AV with the local "
+            "RDNA WMMA BF16->F32 kernel. This changes attention-score storage "
+            "precision and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_attention_av_f32_dim4,
+            "paligemma_vit_hip_attention_av_f32_dim4", false,
+            "Experimental: keep HIP PaliGemma ViT attention QK, softmax, and "
+            "AV in F32, but replace the 224px AV GEMM with a local float4 "
+            "tiled HIP kernel. 448px falls back to rocBLAS.",
+            3);
+    visitor(paligemma_vit_hip_attention_pack_bf16,
+            "paligemma_vit_hip_attention_pack_bf16", false,
+            "Experimental: keep HIP PaliGemma ViT attention QK, softmax, and "
+            "AV in F32, but fuse the post-attention head pack with the existing "
+            "BF16 conversion for attn_out. This is scoped to hip_probe return "
+            "and profile paths.",
+            3);
+    visitor(paligemma_vit_hip_attention_direct_qkv,
+            "paligemma_vit_hip_attention_direct_qkv", false,
+            "Experimental: keep HIP PaliGemma ViT attention QK, softmax, and "
+            "AV in F32, but have rocBLAS read Q/K/V directly from the "
+            "interleaved QKV projection layout instead of splitting to "
+            "head-major scratch buffers.",
+            3);
+    visitor(paligemma_vit_hip_attention_defer_softmax_scale,
+            "paligemma_vit_hip_attention_defer_softmax_scale", false,
+            "Experimental: with attention_pack_bf16, store softmax exp scores "
+            "and apply the per-row reciprocal scale while packing attention "
+            "heads to BF16. QK and AV stay F32, but floating-point association "
+            "changes, so this remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_attention_qk_solution,
+            "paligemma_vit_hip_attention_qk_solution", 0,
+            "Experimental: rocBLAS solution index override for HIP PaliGemma "
+            "ViT F32 attention QK. Zero keeps the rocBLAS default. Nonzero "
+            "values are architecture/runtime-specific bench results.",
+            3);
+    visitor(paligemma_vit_hip_attention_av_solution,
+            "paligemma_vit_hip_attention_av_solution", 0,
+            "Experimental: rocBLAS solution index override for HIP PaliGemma "
+            "ViT F32 attention AV. Zero keeps the rocBLAS default. Nonzero "
+            "values are architecture/runtime-specific bench results.",
+            3);
+    visitor(paligemma_vit_hip_qkv_wmma2d,
+            "paligemma_vit_hip_qkv_wmma2d", false,
+            "Experimental: use the grouped-2D RDNA WMMA 8x4 kernel for HIP "
+            "PaliGemma ViT QKV projection. This only affects hip_probe "
+            "return/profile paths and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_attn_out_wmma2d,
+            "paligemma_vit_hip_attn_out_wmma2d", false,
+            "Experimental: use the grouped-2D RDNA WMMA 8x4 kernel for HIP "
+            "PaliGemma ViT attention-output projection. This only affects "
+            "hip_probe return/profile paths and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_mlp_up_wmma2d,
+            "paligemma_vit_hip_mlp_up_wmma2d", false,
+            "Experimental: use the grouped-2D RDNA WMMA 8x4 kernel for HIP "
+            "PaliGemma ViT MLP up projection. This only affects hip_probe "
+            "return/profile paths and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_mlp_down_wmma8,
+            "paligemma_vit_hip_mlp_down_wmma8", false,
+            "Experimental: use the grouped-N RDNA WMMA kernel for HIP "
+            "PaliGemma ViT MLP down projection. This only affects hip_probe "
+            "return/profile paths and remains opt-in.",
+            3);
+    visitor(paligemma_vit_hip_mlp_down_fused_residual,
+            "paligemma_vit_hip_mlp_down_fused_residual", false,
+            "Experimental: fuse MLP-down bias and residual into the grouped-N "
+            "RDNA WMMA store. Only used with "
+            "paligemma_vit_hip_mlp_down_wmma8.",
+            3);
+    visitor(paligemma_vit_hip_mlp_down_wmma_waves,
+            "paligemma_vit_hip_mlp_down_wmma_waves", 8,
+            "Experimental: grouped-N RDNA WMMA wave count for HIP PaliGemma "
+            "ViT MLP down projection. Supported values are 2, 4, 6, 8, 12, "
+            "and 16. Only used when paligemma_vit_hip_mlp_down_wmma8 is set.",
+            3);
+    visitor(paligemma_vit_hip_mlp_solution_cache,
+            "paligemma_vit_hip_mlp_solution_cache", std::string(""),
+            "Experimental: load a probe-generated rocBLAS MLP solution cache "
+            "for HIP PaliGemma ViT return/profile runs. Empty keeps the "
+            "rocBLAS default solution selection.",
+            3);
+    visitor(paligemma_vit_hip_attention_solution_cache,
+            "paligemma_vit_hip_attention_solution_cache", std::string(""),
+            "Experimental: load a probe-generated rocBLAS attention QK/AV "
+            "solution cache for HIP PaliGemma ViT return/profile runs. Empty "
+            "keeps the explicit attention solution flags or rocBLAS default.",
+            3);
 
     // Since it is not used in the CLI version, the print_verbosity is set
     // higher than others.
@@ -261,6 +547,10 @@ struct InferenceArgs : public ArgsBase<InferenceArgs> {
 
     runtime_config.temperature = temperature;
     runtime_config.top_k = top_k;
+
+    // This is copied into RuntimeConfig because decoder layer execution is
+    // several stack frames below argument parsing and only sees RuntimeConfig.
+    runtime_config.force_flash_attention = force_flash_attention;
   }
 };
 

@@ -384,6 +384,12 @@ def export_paligemma_sbs(
     info = configs.TensorInfo()
     info.name = sbs_name
     info.shape = data.shape
+    # PaliGemma patch embedding arrives from HF with convolution-style extra
+    # dimensions. The runtime reads it as a 2D matmul kernel with columns formed
+    # from the flattened patch dimensions, so the SBS writer must fold those
+    # extra dimensions into the column count.
+    if sbs_name == "img_emb_kernel":
+      info.cols_take_extra_dims = True
     writer.insert(sbs_name, value, packed, info)
 
   def add_qkv_einsum(i):  # Handle qkv for layer i.

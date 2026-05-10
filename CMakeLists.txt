@@ -208,6 +208,12 @@ target_link_libraries(benchmarks libgemma hwy hwy_contrib nlohmann_json::nlohman
 add_executable(debug_prompt evals/debug_prompt.cc)
 target_link_libraries(debug_prompt libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
 
+# Standalone CPU microbenchmark for fixed PaliGemma2 ViT matrix shapes. This is
+# kept outside the test suite so local performance experiments do not depend on
+# the broader GTest setup.
+add_executable(paligemma2_vit_matmul_bench experimental/paligemma2_vit_matmul_bench.cc)
+target_link_libraries(paligemma2_vit_matmul_bench libgemma hwy hwy_contrib)
+
 ## Tests
 set(GEMMA_ENABLE_TESTS OFF CACHE BOOL "Enable Gemma tests")
 if (GEMMA_ENABLE_TESTS)
