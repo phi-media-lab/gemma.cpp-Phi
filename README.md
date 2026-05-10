@@ -1,5 +1,7 @@
 # gemma.cpp-Phi: PaliGemma2 ViT HIP/gfx1150 Branch
 
+[中文说明 / Chinese README](README.zh-CN.md)
+
 This branch is an experimental fork of
 [google/gemma.cpp](https://github.com/google/gemma.cpp) focused on
 PaliGemma2 ViT inference acceleration on a local AMD ROCm/HIP system.
